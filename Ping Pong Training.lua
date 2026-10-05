@@ -1,15 +1,4 @@
---[[
-    PuckAFK | Ping Pong Training Smart Autofarm v1.1.2 - Phase-Aware Native Auto Serve + Fast Rebirth
-    Place: 137737622318848
 
-    Built from the current place/module dump + captured remote traffic.
-    Core route:
-      TRAIN phase -> continuous best-table training + immediate rebirth/progression
-      RACE phase  -> native game Auto Shoot/serve kept running continuously
-      -> phase-aware maintenance/rewards with no train/serve state fighting.
-
-    Uses the game's own current remote/config modules instead of hard-coded fake stats.
-]]
 
 if not game:IsLoaded() then
     game.Loaded:Wait()
@@ -17,16 +6,37 @@ end
 
 local PLACE_ID = 137737622318848
 if game.PlaceId ~= PLACE_ID then
-    warn(("[PuckAFK PPT] Wrong place. Expected %d, got %d"):format(PLACE_ID, game.PlaceId))
+    return
 end
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local GuiService = game:GetService("GuiService")
 local VirtualUser = game:GetService("VirtualUser")
 
+local VirtualInputManager
+pcall(function()
+    VirtualInputManager = game:GetService("VirtualInputManager")
+end)
+
 local LocalPlayer = Players.LocalPlayer
+
+local ExecutorName, ExecutorVersion = "Unknown", ""
+do
+    local identify = type(identifyexecutor) == "function" and identifyexecutor
+        or (type(getexecutorname) == "function" and getexecutorname)
+    if identify then
+        local ok, a, b = pcall(identify)
+        if ok then
+            ExecutorName = tostring(a or "Unknown")
+            ExecutorVersion = tostring(b or "")
+        end
+    end
+end
+local IS_SOLARA = string.find(string.lower(ExecutorName), "solara", 1, true) ~= nil
 
 -- Re-execution cleanup for this game's PuckUI only.
 do
@@ -37,30 +47,70 @@ do
     end
 end
 
-local Modules = ReplicatedStorage:WaitForChild("Modules", 30)
-if not Modules then
-    error("[PuckAFK PPT] ReplicatedStorage.Modules did not load")
+local RemoteFolder = ReplicatedStorage:WaitForChild("Net", 30)
+if not RemoteFolder then
+    error("Ping Pong Training remotes did not load")
 end
 
-local function requireModule(name)
-    local object = Modules:WaitForChild(name, 20)
+-- Resolve remotes straight from ReplicatedStorage.Net. This is intentionally
+-- independent from the game's Modules.Net wrapper because lower-compatibility
+-- executors can differ in how injected ModuleScript requires are handled.
+local Net = {}
+local function indexRemote(object)
+    if object then
+        Net[object.Name] = object
+    end
+end
+for _, object in ipairs(RemoteFolder:GetChildren()) do
+    indexRemote(object)
+end
+RemoteFolder.ChildAdded:Connect(indexRemote)
+
+local Modules = ReplicatedStorage:FindFirstChild("Modules")
+local function tryRequireModule(name)
+    if not Modules then
+        return nil
+    end
+    local object = Modules:FindFirstChild(name) or Modules:WaitForChild(name, 8)
     if not object then
-        error("[PuckAFK PPT] Missing module: " .. tostring(name))
+        return nil
     end
     local ok, result = pcall(require, object)
     if not ok then
-        error("[PuckAFK PPT] Failed to require " .. tostring(name) .. ": " .. tostring(result))
+        return nil
     end
     return result
 end
 
-local Net = requireModule("Net")
-local ZoneConfig = requireModule("ZoneConfig")
-local UpgradeConfig = requireModule("UpgradeConfig")
-local PaddleConfig = requireModule("PaddleConfig")
-local EggConfig = requireModule("EggConfig")
-local ChallengeConfig = requireModule("ChallengeConfig")
-local WeatherConfig = requireModule("WeatherConfig")
+local ZoneConfig = tryRequireModule("ZoneConfig") or {
+    GetByName = function(name) return name and {name = name} or nil end,
+    GetHighestUnlocked = function(unlocked)
+        return type(unlocked) == "table" and unlocked[#unlocked] or "City"
+    end,
+    GetNextLocked = function() return nil end,
+}
+local UpgradeConfig = tryRequireModule("UpgradeConfig") or {
+    GetNextCost = function() return nil end,
+}
+local PaddleConfig = tryRequireModule("PaddleConfig") or {
+    StarterPaddle = "Classic",
+    OwnedFromProgress = function() return {} end,
+    GetEffectiveMult = function() return 1 end,
+    GetNextPurchasable = function() return nil end,
+    GetPrice = function() return nil end,
+}
+local EggConfig = tryRequireModule("EggConfig") or {
+    GetPriceTable = function() return nil end,
+}
+local ChallengeConfig = tryRequireModule("ChallengeConfig") or {
+    PromptName = "ChallengePrompt",
+    ModelName = "Challenge",
+    Get = function() return nil end,
+}
+local WeatherConfig = tryRequireModule("WeatherConfig") or {
+    ChargeCap = function() return 100 end,
+    Current = function() return nil end,
+}
 
 local ENV = (type(getgenv) == "function" and getgenv()) or _G
 if ENV.__PUCKAFK_PING_PONG_TRAINING and type(ENV.__PUCKAFK_PING_PONG_TRAINING.Stop) == "function" then
@@ -100,6 +150,24 @@ local Runtime = {
     LastRebirthSignal = nil,
     ServeRejectStreak = 0,
     Errors = 0,
+    ExecutorName = ExecutorName,
+    ExecutorVersion = ExecutorVersion,
+    IsSolara = IS_SOLARA,
+    RaceMode = nil,
+    RaceTimeRemaining = nil,
+    RaceSyncAt = 0,
+    TrainingAutoState = nil,
+    TrainingAutoSeq = 0,
+    ServerAutoShootEnabled = false,
+    DirectServeOnly = IS_SOLARA,
+    DirectTrainingFallbacks = 0,
+    NativeAutoShootOwned = false,
+    NativeAutoShootStartedAt = 0,
+    LocalPlayerFiredSeq = 0,
+    LastLocalPlayerFiredAt = 0,
+    LastNativeInputMethod = "none",
+    SolaraInputClicks = 0,
+    SolaraInputFailures = 0,
 }
 ENV.__PUCKAFK_PING_PONG_TRAINING = Runtime
 
@@ -107,6 +175,7 @@ local Settings = {
     SmartAutofarm = false,
     TurboMode = true,
     AutoServe = true,
+    ForceDirectServe = false,
     RebirthCheckInterval = 0.65,
     ShotsPerCycle = 1,
     ShotLandingSlack = 0.04,
@@ -135,7 +204,6 @@ local Settings = {
     AutoSpins = true,
     AutoCodes = true,
     AntiIdle = true,
-    Debug = true,
 }
 
 local function addConnection(connection)
@@ -144,18 +212,9 @@ local function addConnection(connection)
 end
 
 local function dlog(...)
-    if not Settings.Debug then
-        return
-    end
-    local parts = {}
-    for i = 1, select("#", ...) do
-        parts[#parts + 1] = tostring(select(i, ...))
-    end
-    print("[PuckAFK PPT] " .. table.concat(parts, " | "))
 end
 
 local StatusLabel
-local StatsParagraph
 local function setStatus(text)
     Runtime.LastStatus = tostring(text or "")
     if StatusLabel and StatusLabel.Set then
@@ -193,6 +252,48 @@ local function safeInvoke(remote, ...)
         return false, packed[2]
     end
     return true, table.unpack(packed, 2, packed.n)
+end
+
+-- Compatibility state mirrors. These use ordinary RemoteEvent listeners and
+-- therefore do not depend on executor-only signal introspection.
+if Net.Race_StateSync and Net.Race_StateSync:IsA("RemoteEvent") then
+    addConnection(Net.Race_StateSync.OnClientEvent:Connect(function(payload)
+        if type(payload) == "table" then
+            Runtime.RaceMode = tostring(payload.mode or Runtime.RaceMode or "")
+            Runtime.RaceTimeRemaining = tonumber(payload.timeRemaining)
+            Runtime.RaceSyncAt = os.clock()
+        end
+    end))
+end
+
+if Net.Training_AutoState and Net.Training_AutoState:IsA("RemoteEvent") then
+    addConnection(Net.Training_AutoState.OnClientEvent:Connect(function(payload)
+        if type(payload) == "table" then
+            Runtime.TrainingAutoState = payload
+            Runtime.TrainingAutoSeq = (Runtime.TrainingAutoSeq or 0) + 1
+        end
+    end))
+end
+
+if Net.Training_Start and Net.Training_Start:IsA("RemoteEvent") then
+    addConnection(Net.Training_Start.OnClientEvent:Connect(function()
+        Runtime.Training = true
+        pcall(function() LocalPlayer:SetAttribute("IsTrainMode", true) end)
+    end))
+end
+
+-- Server-confirmed local firing signal. This is the most reliable way to know
+-- that Solara actually activated the game's own FiringClient. It avoids relying
+-- on private/local flags that can differ between executor environments.
+if Net.PlayerFired and Net.PlayerFired:IsA("RemoteEvent") then
+    addConnection(Net.PlayerFired.OnClientEvent:Connect(function(payload)
+        if type(payload) == "table" and tonumber(payload.userId) == LocalPlayer.UserId then
+            Runtime.LocalPlayerFiredSeq = (Runtime.LocalPlayerFiredSeq or 0) + 1
+            Runtime.LastLocalPlayerFiredAt = os.clock()
+            Runtime.NativeAutoShootOwned = true
+            Runtime.ServeRejectStreak = 0
+        end
+    end))
 end
 
 -- Rebirth confirmation channel. The stock UI uses this same event, so listening
@@ -388,15 +489,169 @@ local function getAutoShootButton()
     return right and right:FindFirstChild("AutoShootBtn")
 end
 
+local function getButtonScreenCenter(button)
+    if not button or not button:IsA("GuiButton") then
+        return nil
+    end
+    local size = button.AbsoluteSize
+    if size.X < 2 or size.Y < 2 then
+        return nil
+    end
+
+    -- GetMouseLocation / injected mouse coordinates include the top-left GUI inset
+    -- while GuiObject.AbsolutePosition does not. Add the inset so the click lands
+    -- on the visible button on current Roblox clients.
+    local inset = Vector2.new(0, 0)
+    pcall(function()
+        local topLeft = GuiService:GetGuiInset()
+        if typeof(topLeft) == "Vector2" then
+            inset = topLeft
+        end
+    end)
+
+    return button.AbsolutePosition + (size / 2) + inset
+end
+
+local function buttonActuallyVisible(button)
+    if not button or not button.Parent then
+        return false
+    end
+    local node = button
+    while node do
+        if node:IsA("GuiObject") and node.Visible == false then
+            return false
+        end
+        if node:IsA("ScreenGui") and node.Enabled == false then
+            return false
+        end
+        node = node.Parent
+    end
+    return button.AbsoluteSize.X >= 2 and button.AbsoluteSize.Y >= 2
+end
+
+local function withIdentity(identity, callback)
+    local getId = type(getthreadidentity) == "function" and getthreadidentity
+        or (type(getidentity) == "function" and getidentity)
+    local setId = type(setthreadidentity) == "function" and setthreadidentity
+        or (type(setidentity) == "function" and setidentity)
+    local previous
+    if getId then
+        pcall(function() previous = getId() end)
+    end
+    if setId then
+        pcall(setId, identity)
+    end
+    local ok, a, b = pcall(callback)
+    if setId and previous ~= nil then
+        pcall(setId, previous)
+    end
+    return ok, a, b
+end
+
+local function clickGuiButtonWithInput(button)
+    if not buttonActuallyVisible(button) then
+        return false, "button not visible"
+    end
+    local center = getButtonScreenCenter(button)
+    if not center then
+        return false, "button has no screen center"
+    end
+    local x = math.floor(center.X + 0.5)
+    local y = math.floor(center.Y + 0.5)
+
+    local function trySolaraMouse()
+        local moveAbs = type(mousemoveabs) == "function" and mousemoveabs or nil
+        local click = type(mouse1click) == "function" and mouse1click or nil
+        local press = type(mouse1press) == "function" and mouse1press or nil
+        local release = type(mouse1release) == "function" and mouse1release or nil
+        if not moveAbs or not (click or (press and release)) then
+            return false
+        end
+
+        if type(isrbxactive) == "function" then
+            local okActive, active = pcall(isrbxactive)
+            if okActive and not active then
+                return false
+            end
+        end
+
+        local oldPos
+        pcall(function() oldPos = UserInputService:GetMouseLocation() end)
+        local ok = pcall(function()
+            moveAbs(x, y)
+            task.wait(0.05)
+            if click then
+                click()
+            else
+                press()
+                task.wait(0.05)
+                release()
+            end
+            task.wait(0.05)
+            if typeof(oldPos) == "Vector2" then
+                moveAbs(math.floor(oldPos.X + 0.5), math.floor(oldPos.Y + 0.5))
+            end
+        end)
+        if ok then
+            Runtime.LastNativeInputMethod = "SolaraMouse"
+            Runtime.SolaraInputClicks = (Runtime.SolaraInputClicks or 0) + 1
+            return true
+        end
+        return false
+    end
+
+    local function tryVirtualInputManager()
+        if not VirtualInputManager then
+            return false
+        end
+        local ok = withIdentity(8, function()
+            VirtualInputManager:SendMouseMoveEvent(x, y, game)
+            VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 0)
+            VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 0)
+        end)
+        if ok then
+            Runtime.LastNativeInputMethod = "VirtualInputManager"
+            Runtime.SolaraInputClicks = (Runtime.SolaraInputClicks or 0) + 1
+            return true
+        end
+        return false
+    end
+
+    -- On Solara, use its documented real mouse input first while Roblox is focused.
+    -- This most closely reproduces a human click on AutoShootBtn and therefore lets
+    -- the game's own FiringClient create all private state. VIM is the AFK fallback.
+    if IS_SOLARA then
+        if trySolaraMouse() then
+            return true
+        end
+        if tryVirtualInputManager() then
+            return true
+        end
+    else
+        if tryVirtualInputManager() then
+            return true
+        end
+        if trySolaraMouse() then
+            return true
+        end
+    end
+
+    Runtime.SolaraInputFailures = (Runtime.SolaraInputFailures or 0) + 1
+    return false, "no compatible input method"
+end
+
 local function pressGuiButton(button)
     if not button then
         return false
     end
+
+    -- Rich executors can invoke the callback signal directly.
     if type(firesignal) == "function" then
         local ok = pcall(function()
             firesignal(button.MouseButton1Up)
         end)
         if ok then
+            Runtime.LastNativeInputMethod = "firesignal"
             return true
         end
     end
@@ -414,38 +669,48 @@ local function pressGuiButton(button)
                 end
             end
             if fired then
+                Runtime.LastNativeInputMethod = "getconnections"
                 return true
             end
         end
     end
-    return false
+
+    -- Solara and other lower-UNC executors: click the REAL game button with input.
+    local ok, reason = clickGuiButtonWithInput(button)
+    if not ok then
+        dlog("Native button input failed", tostring(reason))
+    end
+    return ok
 end
 
 local function stopBuiltInAutoShoot()
-    if LocalPlayer:GetAttribute("AutoShootActive") ~= true then
+    local localActive = LocalPlayer:GetAttribute("AutoShootActive") == true
+    local serverActive = Runtime.ServerAutoShootEnabled == true
+    local nativeOwned = Runtime.NativeAutoShootOwned == true
+
+    if not localActive and not serverActive and not nativeOwned then
         return true
     end
 
-    local button = getAutoShootButton()
-    if button then
-        pressGuiButton(button)
+    -- If we started the game's native Auto Shoot, stop it through the same real
+    -- button path so FiringClient's private boolean is toggled too. Merely sending
+    -- AutoShootState=false does not necessarily stop the client's internal loop.
+    if nativeOwned or localActive then
+        local button = getAutoShootButton()
+        if button then
+            pressGuiButton(button)
+            waitAlive(0.12)
+        end
     end
 
-    local deadline = os.clock() + 1.1
-    while Runtime.Alive and os.clock() < deadline and LocalPlayer:GetAttribute("AutoShootActive") == true do
-        task.wait(0.04)
-    end
-
-    if LocalPlayer:GetAttribute("AutoShootActive") == true then
-        -- Server cleanup fallback. This does not pretend the FiringClient's private
-        -- u286 flag is changed; it is only used after the native button path failed.
-        safeFire(Net.AutoShootState, false)
-        pcall(function()
-            LocalPlayer:SetAttribute("AutoShootActive", false)
-        end)
-        task.wait(0.08)
-    end
-    return LocalPlayer:GetAttribute("AutoShootActive") ~= true
+    safeFire(Net.AutoShootState, false)
+    Runtime.ServerAutoShootEnabled = false
+    Runtime.NativeAutoShootOwned = false
+    Runtime.NativeAutoShootStartedAt = 0
+    pcall(function()
+        LocalPlayer:SetAttribute("AutoShootActive", false)
+    end)
+    return true
 end
 
 local function stopTraining()
@@ -464,6 +729,47 @@ local function stopTraining()
             task.wait(Settings.TurboMode and 0.035 or 0.06)
         end
     end
+end
+
+local function findTrainingTargetCFrame(targetName)
+    if type(targetName) ~= "string" or targetName == "" then
+        return nil
+    end
+
+    local object = Workspace:FindFirstChild(targetName, true)
+    if not object then
+        return nil
+    end
+    if object:IsA("BasePart") then
+        return object.CFrame
+    elseif object:IsA("Model") then
+        local ok, pivot = pcall(object.GetPivot, object)
+        if ok then return pivot end
+    elseif object:IsA("Attachment") then
+        return object.WorldCFrame
+    end
+
+    local part = object:FindFirstChildWhichIsA("BasePart", true)
+    return part and part.CFrame or nil
+end
+
+local function directTrainingStartFromAutoState()
+    local state = Runtime.TrainingAutoState
+    if type(state) ~= "table" or state.active ~= true then
+        return false
+    end
+    local targetName = state.targetName
+    local targetCFrame = findTrainingTargetCFrame(targetName)
+    if not targetName or not targetCFrame or not Net.Training_RequestStart then
+        return false
+    end
+
+    local ok = safeFire(Net.Training_RequestStart, targetName, targetCFrame)
+    if ok then
+        Runtime.DirectTrainingFallbacks = (Runtime.DirectTrainingFallbacks or 0) + 1
+        dlog("Direct training fallback", targetName)
+    end
+    return ok
 end
 
 local function startBestTraining()
@@ -487,16 +793,21 @@ local function startBestTraining()
     -- Training_AutoState, then TrainingAutoClient sends Training_RequestStart.
     -- v1.1.0 could stop again before this handshake settled on slower servers.
     local startedAt = os.clock()
-    local deadline = startedAt + (Settings.TurboMode and 1.6 or 2.2)
+    local deadline = startedAt + (Settings.TurboMode and 2.0 or 2.6)
     local resent = false
+    local directTried = false
     while Runtime.Alive and os.clock() < deadline do
         if LocalPlayer:GetAttribute("IsTrainMode") == true then
             Runtime.Training = true
             return true
         end
-        if not resent and os.clock() - startedAt >= 0.65 then
+        local elapsed = os.clock() - startedAt
+        if not resent and elapsed >= 0.55 then
             resent = true
             safeFire(Net.Training_SetAuto, true)
+        end
+        if not directTried and elapsed >= 0.75 then
+            directTried = directTrainingStartFromAutoState()
         end
         task.wait(0.04)
     end
@@ -532,7 +843,17 @@ local function smartTrainingBurst(seconds)
 end
 
 local function isRacePhase()
-    -- RaceClient sets this true during the Train phase and false during Race.
+    -- Prefer the server's Race_StateSync payload when we have seen one recently.
+    -- The stock client attribute remains a fallback for late execution / missed sync.
+    local mode = Runtime.RaceMode
+    if type(mode) == "string" and mode ~= "" then
+        local lowered = string.lower(mode)
+        if lowered == "race" then
+            return true
+        elseif lowered == "intermission" or lowered == "train" or lowered == "training" then
+            return false
+        end
+    end
     return LocalPlayer:GetAttribute("RaceIntermission") ~= true
 end
 
@@ -578,9 +899,22 @@ local function ensureNativeAutoShoot()
     if not isRacePhase() then
         return false
     end
+    if Settings.ForceDirectServe then
+        return false
+    end
 
-    if LocalPlayer:GetAttribute("AutoShootActive") == true then
-        return true
+    -- Once the native loop has been confirmed from PlayerFired, keep it alive for
+    -- the Race phase. If it becomes silent for too long, re-arm it automatically.
+    if Runtime.NativeAutoShootOwned then
+        local reference = math.max(
+            tonumber(Runtime.LastLocalPlayerFiredAt) or 0,
+            tonumber(Runtime.NativeAutoShootStartedAt) or 0
+        )
+        if reference > 0 and os.clock() - reference < 12 then
+            return true
+        end
+        dlog("Native Auto Serve watchdog", "no local PlayerFired for 12s; re-arming")
+        Runtime.NativeAutoShootOwned = false
     end
 
     stopTraining()
@@ -588,28 +922,63 @@ local function ensureNativeAutoShoot()
         Runtime.NativeServeFailures = Runtime.NativeServeFailures + 1
         return false
     end
-    waitAlive(math.max(0.10, tonumber(Settings.ServeReadyDelay) or 0.18))
+    waitAlive(math.max(IS_SOLARA and 0.20 or 0.10, tonumber(Settings.ServeReadyDelay) or 0.18))
 
     local button = getAutoShootButton()
-    if button and pressGuiButton(button) then
-        local deadline = os.clock() + 1.35
+    if not button then
+        Runtime.NativeServeFailures = Runtime.NativeServeFailures + 1
+        dlog("Native Auto Serve unavailable", "AutoShootBtn missing")
+        return false
+    end
+
+    -- Race UI can become visible a few frames after Race_StateSync. Wait for a real
+    -- clickable rectangle instead of firing into a hidden button and falling back.
+    local visibleDeadline = os.clock() + 1.5
+    while Runtime.Alive and isRacePhase() and os.clock() < visibleDeadline and not buttonActuallyVisible(button) do
+        task.wait(0.05)
+    end
+
+    local beforeSeq = Runtime.LocalPlayerFiredSeq or 0
+    local beforeAt = Runtime.LastLocalPlayerFiredAt or 0
+    if pressGuiButton(button) then
+        Runtime.NativeAutoShootStartedAt = os.clock()
+        local deadline = os.clock() + (IS_SOLARA and 3.0 or 1.8)
         while Runtime.Alive and os.clock() < deadline do
-            if LocalPlayer:GetAttribute("AutoShootActive") == true then
-                Runtime.NativeServeStarts = Runtime.NativeServeStarts + 1
-                Runtime.ServeRejectStreak = 0
-                dlog("Native Auto Serve enabled", "Race phase")
-                return true
-            end
             if not isRacePhase() then
                 return false
             end
-            task.wait(0.04)
+            if (Runtime.LocalPlayerFiredSeq or 0) > beforeSeq
+                or (Runtime.LastLocalPlayerFiredAt or 0) > beforeAt
+                or LocalPlayer:GetAttribute("AutoShootActive") == true then
+                Runtime.NativeAutoShootOwned = true
+                Runtime.NativeServeStarts = Runtime.NativeServeStarts + 1
+                Runtime.ServeRejectStreak = 0
+                dlog("Native Auto Serve confirmed", "method=" .. tostring(Runtime.LastNativeInputMethod))
+                return true
+            end
+            task.wait(0.05)
         end
     end
 
     Runtime.NativeServeFailures = Runtime.NativeServeFailures + 1
-    dlog("Native Auto Serve unavailable", "using direct RequestShot fallback")
+    dlog("Native Auto Serve not confirmed", "method=" .. tostring(Runtime.LastNativeInputMethod), "falling back to direct RequestShot")
     return false
+end
+
+local function setServerAutoShootState(enabled)
+    enabled = enabled == true
+    if Runtime.ServerAutoShootEnabled == enabled then
+        return true
+    end
+    local ok = safeFire(Net.AutoShootState, enabled)
+    if ok then
+        Runtime.ServerAutoShootEnabled = enabled
+        if Settings.ForceDirectServe then
+            pcall(function() LocalPlayer:SetAttribute("AutoShootActive", enabled) end)
+        end
+        dlog("Server AutoShootState", tostring(enabled))
+    end
+    return ok
 end
 
 local function prepareDirectServe()
@@ -643,6 +1012,15 @@ local function performMaxShot()
         return false
     end
 
+    -- The stock Auto Shoot button sends AutoShootState=true before it starts the
+    -- firing loop. Solara cannot invoke that GUI callback via firesignal or
+    -- getconnections, so mirror the server-visible state explicitly.
+    if not setServerAutoShootState(true) then
+        Runtime.ServeRejects = Runtime.ServeRejects + 1
+        return false
+    end
+    waitAlive(IS_SOLARA and 0.12 or 0.06)
+
     local charge = 100
     local okCap, cap = pcall(WeatherConfig.ChargeCap)
     if okCap and tonumber(cap) then
@@ -655,7 +1033,11 @@ local function performMaxShot()
         Runtime.ServeRejects = Runtime.ServeRejects + 1
         Runtime.ServeRejectStreak = Runtime.ServeRejectStreak + 1
         dlog("Direct serve rejected", "charge=" .. tostring(charge), "streak=" .. tostring(Runtime.ServeRejectStreak))
-        task.wait(math.min(1.25, 0.35 + Runtime.ServeRejectStreak * 0.15))
+        if Runtime.ServeRejectStreak % 2 == 0 then
+            Runtime.ServerAutoShootEnabled = false
+            setServerAutoShootState(true)
+        end
+        task.wait(math.min(1.35, 0.40 + Runtime.ServeRejectStreak * 0.16))
         return false
     end
 
@@ -679,7 +1061,7 @@ local function performMaxShot()
     return landed
 end
 
-local function performServeBurst(count, requireSmartEnabled)
+local function performServeBurst(count, requireSmartEnabled, skipNativeAttempt)
     if not Settings.AutoServe or Runtime.ChallengeActive or not isRacePhase() then
         return 0
     end
@@ -689,8 +1071,10 @@ local function performServeBurst(count, requireSmartEnabled)
 
     -- First choice: turn on the game's own Auto Shoot once and leave it running for
     -- the whole Race phase. This is both more reliable and faster overall than
-    -- repeatedly toggling train/serve state around every shot.
-    if ensureNativeAutoShoot() then
+    -- repeatedly toggling train/serve state around every shot. The master loop can
+    -- set skipNativeAttempt after it already tried native once, preventing a second
+    -- click from accidentally toggling the real Auto Shoot back OFF.
+    if not skipNativeAttempt and ensureNativeAutoShoot() then
         return 1
     end
 
@@ -1488,13 +1872,38 @@ end
 
 -- UI -------------------------------------------------------------------------
 local PuckUI
+local PUCKUI_URL = "https://raw.githubusercontent.com/PuckAFK/Puck-Loader/refs/heads/main/ui/PuckUI.lua"
+local function fetchText(url)
+    local ok, body = pcall(function() return game:HttpGet(url) end)
+    if ok and type(body) == "string" and #body > 100 then
+        return body
+    end
+
+    local requestFn = type(request) == "function" and request
+        or (type(http_request) == "function" and http_request)
+        or (type(httprequest) == "function" and httprequest)
+    if requestFn then
+        local reqOk, response = pcall(requestFn, {Url = url, Method = "GET"})
+        if reqOk and type(response) == "table" then
+            local candidate = response.Body or response.body
+            if type(candidate) == "string" and #candidate > 100 then
+                return candidate
+            end
+        end
+    end
+    return nil
+end
+
 local uiOk, uiResult = pcall(function()
-    return loadstring(game:HttpGet("https://raw.githubusercontent.com/PuckAFK/Puck-Loader/refs/heads/main/ui/PuckUI.lua"))()
+    local source = fetchText(PUCKUI_URL)
+    assert(type(source) == "string", "failed to download PuckUI")
+    local chunk, compileErr = loadstring(source, "PuckUI")
+    assert(type(chunk) == "function", compileErr or "PuckUI compile failed")
+    return chunk()
 end)
-if uiOk then
+if uiOk and type(uiResult) == "table" then
     PuckUI = uiResult
 else
-    warn("[PuckAFK PPT] PuckUI failed to load: " .. tostring(uiResult))
 end
 
 local function makeToggle(tab, name, key, default)
@@ -1528,7 +1937,7 @@ if PuckUI then
         GuiName = "PuckAFK_PPT_UI",
         Width = 550,
         Height = 590,
-        ConfigId = "PingPongTraining_v1_1_2_PhaseAwareNativeServe",
+        ConfigId = "PingPongTraining_v1_1_5_CleanSolara",
         Configs = {DefaultProfile = "default", AutoSave = true, AutoLoad = true},
     })
 
@@ -1537,10 +1946,10 @@ if PuckUI then
     StatusLabel = FarmTab:CreateLabel("Status: Ready")
     makeToggle(FarmTab, "Smart Autofarm", "SmartAutofarm", false)
     makeToggle(FarmTab, "Turbo Mode", "TurboMode", true)
-    makeToggle(FarmTab, "Auto Serve (Native During Race)", "AutoServe", true)
+    makeToggle(FarmTab, "Auto Serve", "AutoServe", true)
     FarmTab:CreateParagraph({
         Title = "Phase-Aware Route",
-        Content = "Train phase: stay on the best table continuously and rebirth/progress immediately. Race phase: leave training once, move to CautionLine and keep the game's native Auto Shoot/serve running continuously. Direct max-charge serve is only used as a fallback if the executor cannot trigger the native button.",
+        Content = "Automatically trains during Train and serves throughout Race, then repeats the cycle while handling progression in the background.",
         Height = 90,
     })
     FarmTab:CreateSlider({
@@ -1569,27 +1978,6 @@ if PuckUI then
         Flag = "PPT_MaintenanceSeconds",
         Callback = function(v) Settings.MaintenanceEvery = math.max(1, math.floor(tonumber(v) or 3)) end,
     })
-    FarmTab:CreateButton({Name = "Run Current Phase Now", Callback = function()
-        task.spawn(function()
-            if Runtime.Busy then return end
-            Runtime.Busy = true
-            tryWorldProgression()
-            if isRacePhase() then
-                stopTraining()
-                performServeBurst(Settings.ShotsPerCycle, false)
-                setStatus("Race | Auto Serve running")
-            else
-                stopBuiltInAutoShoot()
-                tryRebirthChain(Settings.RebirthChainMax)
-                tryUpgrades(5)
-                tryPaddles(5)
-                startBestTraining()
-                setStatus("Train | Auto Training running")
-            end
-            Runtime.Busy = false
-        end)
-    end})
-
     local ProgressTab = Window:CreateTab("Progression")
     ProgressTab:CreateSection("World & Economy")
     makeToggle(ProgressTab, "Auto Unlock + Enter Best World", "AutoWorlds", true)
@@ -1686,29 +2074,90 @@ if PuckUI then
         end)
     end})
 
-    local DebugTab = Window:CreateTab("Debug")
-    DebugTab:CreateSection("Runtime")
-    StatsParagraph = DebugTab:CreateParagraph({Title = "Live", Content = "Waiting...", Height = 86})
-    makeToggle(DebugTab, "Debug Console Logs", "Debug", true)
-    makeToggle(DebugTab, "Anti Idle", "AntiIdle", true)
-    DebugTab:CreateButton({Name = "Stop All Automation", Callback = function()
-        Settings.SmartAutofarm = false
-        Runtime.Master = false
-        stopTraining()
-        stopBuiltInAutoShoot()
-        if Runtime.ChallengeActive then
-            safeFire(Net.Challenge_Cancel)
-        end
-        setStatus("Stopped")
-    end})
-
     Window:CreateTab("Settings")
 
     PuckUI:Notify({
         Title = "Ping Pong Training",
-        Content = "Phase-aware build loaded. It trains continuously during Train and uses native Auto Shoot continuously during Race. Rebirth checks run rapidly during Train.",
-        Duration = 4,
+        Content = "Smart Autofarm ready.",
+        Duration = 3,
     })
+end
+
+if not PuckUI then
+    -- Last-resort UI made only from ordinary Roblox instances. This keeps the
+    -- script usable even if an executor temporarily blocks GitHub/HttpGet.
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 8)
+    if playerGui then
+        local old = playerGui:FindFirstChild("PuckAFK_PPT_Fallback")
+        if old then old:Destroy() end
+        local gui = Instance.new("ScreenGui")
+        gui.Name = "PuckAFK_PPT_Fallback"
+        gui.ResetOnSpawn = false
+        gui.DisplayOrder = 10000
+        gui.Parent = playerGui
+
+        local frame = Instance.new("Frame")
+        frame.Size = UDim2.fromOffset(310, 154)
+        frame.Position = UDim2.fromOffset(24, 120)
+        frame.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
+        frame.BorderColor3 = Color3.fromRGB(55, 55, 55)
+        frame.Parent = gui
+
+        local title = Instance.new("TextLabel")
+        title.BackgroundTransparency = 1
+        title.Size = UDim2.new(1, -16, 0, 30)
+        title.Position = UDim2.fromOffset(8, 4)
+        title.Font = Enum.Font.Code
+        title.TextSize = 15
+        title.TextColor3 = Color3.fromRGB(235, 235, 235)
+        title.TextXAlignment = Enum.TextXAlignment.Left
+        title.Text = "PuckAFK | Ping Pong Training"
+        title.Parent = frame
+
+        local status = Instance.new("TextLabel")
+        status.BackgroundTransparency = 1
+        status.Size = UDim2.new(1, -16, 0, 40)
+        status.Position = UDim2.fromOffset(8, 34)
+        status.Font = Enum.Font.Code
+        status.TextSize = 12
+        status.TextColor3 = Color3.fromRGB(170, 170, 170)
+        status.TextWrapped = true
+        status.TextXAlignment = Enum.TextXAlignment.Left
+        status.Text = "Ready"
+        status.Parent = frame
+        StatusLabel = {Set = function(_, value) status.Text = tostring(value) end}
+
+        local toggle = Instance.new("TextButton")
+        toggle.Size = UDim2.fromOffset(286, 32)
+        toggle.Position = UDim2.fromOffset(12, 82)
+        toggle.Font = Enum.Font.Code
+        toggle.TextSize = 14
+        toggle.TextColor3 = Color3.fromRGB(240, 240, 240)
+        toggle.BackgroundColor3 = Color3.fromRGB(32, 32, 32)
+        toggle.Text = "Smart Autofarm: OFF"
+        toggle.Parent = frame
+        toggle.MouseButton1Click:Connect(function()
+            Settings.SmartAutofarm = not Settings.SmartAutofarm
+            Runtime.Master = Settings.SmartAutofarm
+            Runtime.Phase = "Unknown"
+            toggle.Text = "Smart Autofarm: " .. (Settings.SmartAutofarm and "ON" or "OFF")
+            if not Settings.SmartAutofarm then
+                stopTraining()
+                stopBuiltInAutoShoot()
+            end
+        end)
+
+        local rebirth = Instance.new("TextButton")
+        rebirth.Size = UDim2.fromOffset(286, 26)
+        rebirth.Position = UDim2.fromOffset(12, 120)
+        rebirth.Font = Enum.Font.Code
+        rebirth.TextSize = 12
+        rebirth.TextColor3 = Color3.fromRGB(220, 220, 220)
+        rebirth.BackgroundColor3 = Color3.fromRGB(28, 28, 28)
+        rebirth.Text = "Rebirth Now"
+        rebirth.Parent = frame
+        rebirth.MouseButton1Click:Connect(function() task.spawn(function() tryRebirthChain(Settings.RebirthChainMax) end) end)
+    end
 end
 
 -- Background workers ---------------------------------------------------------
@@ -1761,34 +2210,6 @@ task.spawn(function()
     end
 end)
 
--- Runtime stats worker.
-task.spawn(function()
-    while Runtime.Alive do
-        if StatsParagraph and StatsParagraph.Set then
-            local weather = nil
-            pcall(function() weather = WeatherConfig.Current() end)
-            local profile = getProfile()
-            local world = currentWorld(profile)
-            local text = table.concat({
-                "World: " .. tostring(world),
-                "Coins: " .. bnFormat(currentCoins()),
-                "Power: " .. bnFormat(currentPower()),
-                "Weather: " .. tostring(weather or "None"),
-                ("Phase: %s | Train=%s AutoTrain=%s Shot=%s AutoShoot=%s"):format(
-                    phaseName(),
-                    tostring(LocalPlayer:GetAttribute("IsTrainMode") == true),
-                    tostring(LocalPlayer:GetAttribute("AutoTrainActive") == true),
-                    tostring(LocalPlayer:GetAttribute("ShotInFlight") == true),
-                    tostring(LocalPlayer:GetAttribute("AutoShootActive") == true)
-                ),
-                ("Ticks %d | DirectServes %d | Rejects %d | NativeStarts %d | NativeFail %d | Rebirths %d | Hatches %d | Fusions %d | Errors %d"):format(Runtime.Cycles, Runtime.Shots, Runtime.ServeRejects, Runtime.NativeServeStarts, Runtime.NativeServeFailures, Runtime.RebirthsDone, Runtime.Hatches, Runtime.Fusions, Runtime.Errors),
-            }, "\n")
-            pcall(StatsParagraph.Set, StatsParagraph, {Title = "Live", Content = text})
-        end
-        task.wait(2.5)
-    end
-end)
-
 -- Master smart farm.
 -- IMPORTANT: the game itself has two mutually-exclusive phases:
 --   RaceIntermission=true  -> TRAIN (FiringClient refuses shots)
@@ -1824,10 +2245,10 @@ task.spawn(function()
                         if native then
                             setStatus("Race | Native Auto Serve running continuously")
                         else
-                            -- Executor does not expose the GUI callback: use a bounded
-                            -- direct serve fallback, but ONLY while Race allows shots.
-                            performServeBurst(Settings.ShotsPerCycle, true)
-                            setStatus("Race | Direct serve fallback")
+                            -- Native input could not be confirmed. Keep direct serving as
+                            -- a last-resort fallback instead of making it Solara's primary path.
+                            performServeBurst(Settings.ShotsPerCycle, true, true)
+                            setStatus(IS_SOLARA and "Race | Solara native failed; direct fallback" or "Race | Direct serve fallback")
                         end
                     else
                         stopBuiltInAutoShoot()
@@ -1892,7 +2313,6 @@ task.spawn(function()
             Runtime.Busy = false
             if not ok then
                 Runtime.Errors = Runtime.Errors + 1
-                warn("[PuckAFK PPT] Phase controller error: " .. tostring(err))
                 setStatus("Recovered from phase-controller error")
                 task.wait(Settings.TurboMode and 0.2 or 0.5)
             else
@@ -1926,4 +2346,4 @@ function Runtime.Stop()
 end
 
 setStatus("Ready - enable Smart Autofarm")
-dlog("Loaded v1.1.2 Phase-Aware Native Auto Serve + Fast Rebirth", "PuckUI=" .. tostring(PuckUI ~= nil))
+dlog("Loaded v1.1.5 Clean Solara Build", "Executor=" .. tostring(ExecutorName), "PuckUI=" .. tostring(PuckUI ~= nil))
